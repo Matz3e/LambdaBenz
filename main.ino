@@ -46,6 +46,7 @@ static float VREF_VOLTS = 5.046f;
 #include <SPI.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
+#include <EEPROM.h>
 
 // ---------------- LCD ----------------
 LiquidCrystal_I2C lcd(0x27, 16, 2); // adjust to 0x3F if needed
@@ -72,6 +73,8 @@ LiquidCrystal_I2C lcd(0x27, 16, 2); // adjust to 0x3F if needed
 #define UR_ANALOG_INPUT_PIN   1
 #define UA_ANALOG_INPUT_PIN   0
 
+#define CAL_BUTTON_PIN        4   // Free-Air-Cal-Taster an D4 (gegen GND, INPUT_PULLUP)
+
 // ---------------- Parameters ----------------
 #define SERIAL_RATE           1    // Hz (1-100)
 
@@ -87,6 +90,12 @@ int CJ125_Status = 0;
 
 // Free-Air-Calibration Offset
 int UA_Offset = 0;
+bool ua_offset_valid = false;
+
+// EEPROM Layout
+const uint16_t EEPROM_MAGIC          = 0x4C53; // 'LS'
+const int      EEPROM_ADDR_MAGIC     = 0;
+const int      EEPROM_ADDR_UA_OFFSET = 2;
 
 // PID variables
 int dState;
@@ -188,6 +197,33 @@ inline float ubat_from_adc(int adcUB) {
   return vadc * UBAT_DIVIDER_GAIN;
 }
 
+// EEPROM-Helpers
+void load_calibration() {
+  uint16_t magic;
+  EEPROM.get(EEPROM_ADDR_MAGIC, magic);
+
+  if (magic == EEPROM_MAGIC) {
+    EEPROM.get(EEPROM_ADDR_UA_OFFSET, UA_Offset);
+    ua_offset_valid = true;
+    DBGLN1("EEPROM: UA_Offset loaded");
+    DBG1("EEPROM: UA_Offset="); DBGLN1(UA_Offset);
+  } else {
+    ua_offset_valid = false;
+    UA_Offset = 0;
+    DBGLN1("EEPROM: no valid cal, UA_Offset=0");
+  }
+}
+
+void save_calibration() {
+  EEPROM.put(EEPROM_ADDR_UA_OFFSET, UA_Offset);
+  uint16_t magic = EEPROM_MAGIC;
+  EEPROM.put(EEPROM_ADDR_MAGIC, magic);
+  ua_offset_valid = true;
+
+  DBGLN1("EEPROM: UA_Offset saved");
+  DBG1("EEPROM: UA_Offset="); DBGLN1(UA_Offset);
+}
+
 // ---------------- PID ----------------
 int Heater_PID_Control(int input) {
   int error = adcValue_UR_Optimal - input;
@@ -250,9 +286,8 @@ void lcd_print_boot(const char* line2) {
   lcd.print(line2);
 }
 
-// Fix: kein lcd.clear() hier, um Flackern zu reduzieren
+// ohne lcd.clear() um Flackern zu reduzieren
 void lcd_print_two(float ub_v, int pwm, float lambda, float o2, bool lambda_valid, bool o2_valid) {
-  // Zeile 0: "UB x.xV AFRyy.y"
   lcd.setCursor(0,0);
   lcd.print("UB ");
   lcd.print(ub_v, 1);
@@ -266,7 +301,6 @@ void lcd_print_two(float ub_v, int pwm, float lambda, float o2, bool lambda_vali
     lcd.print("  - ");
   }
 
-  // Zeile 1: "Lx.xxx O2 yy.y%"
   lcd.setCursor(0,1);
   lcd.print("L");
   if (lambda_valid) {
@@ -288,16 +322,13 @@ void calibrate_free_air() {
   DBGLN1("FREE AIR CAL: Starting calibration on 20.9% O2");
   lcd_print_boot("Free Air Cal...");
 
-  // Sensor muss heiß und stabil sein - 30 Sekunden warten
   DBGLN1("FREE AIR CAL: Waiting for sensor to stabilize (30s)");
   for (int i = 0; i < 30; i++) {
-    // PID läuft weiter zur Temperaturstabilisierung
     adcValue_UR = analogRead(UR_ANALOG_INPUT_PIN);
     HeaterOutput = Heater_PID_Control(adcValue_UR);
     analogWrite(HEATER_OUTPUT_PIN, HeaterOutput);
     delay(1000);
 
-    // LCD Countdown
     lcd.clear();
     lcd.setCursor(0,0);
     lcd.print("Stabilizing...");
@@ -307,7 +338,6 @@ void calibrate_free_air() {
     lcd.print("s");
   }
 
-  // 10 Messungen mitteln für Stabilität
   long ua_sum = 0;
   for (int i = 0; i < 10; i++) {
     ua_sum += analogRead(UA_ANALOG_INPUT_PIN);
@@ -315,16 +345,13 @@ void calibrate_free_air() {
   }
   int ua_average = ua_sum / 10;
 
-  // ADC-Wert für 20.9% O2 sollte bei ca. 854 liegen (laut Oxygen_Conversion Tabelle)
   const int TARGET_ADC_20_9_PERCENT = 854;
-
   UA_Offset = TARGET_ADC_20_9_PERCENT - ua_average;
 
   DBG1("FREE AIR CAL: Measured UA_ADC="); DBGLN1(ua_average);
   DBG1("FREE AIR CAL: Target UA_ADC="); DBGLN1(TARGET_ADC_20_9_PERCENT);
   DBG1("FREE AIR CAL: Calculated Offset="); DBGLN1(UA_Offset);
 
-  // Zeige Kalibrierungsergebnis
   lcd.clear();
   lcd.setCursor(0,0);
   lcd.print("Cal Complete!");
@@ -332,6 +359,9 @@ void calibrate_free_air() {
   lcd.print("Offset: ");
   lcd.print(UA_Offset);
   delay(3000);
+
+  // im EEPROM speichern
+  save_calibration();
 }
 
 // ---------------- Start sequence ----------------
@@ -339,7 +369,6 @@ void start() {
   DBGLN1("WAIT: Supply & CJ125 OK check...");
   lcd_print_boot("Wait CJ125/UB");
 
-  // Optional: Timeout für CJ125/UB-Wait
   unsigned long start_ms = millis();
   const unsigned long wait_timeout_ms = 10000; // 10s
 
@@ -365,7 +394,6 @@ void start() {
     }
     if (CJ125_Status == CJ125_DIAG_REG_STATUS_OK && UB_V >= UBAT_MIN_V) break;
 
-    // Timeout-Handling
     if (millis() - start_ms > wait_timeout_ms) {
       DBGLN1("ERROR: CJ125/UB wait timeout");
       lcd_print_boot("CJ125/UB timeout");
@@ -441,8 +469,8 @@ void start() {
   lcd_print_boot("PID active");
   analogWrite(HEATER_OUTPUT_PIN, 0);
 
-  // Free-Air-Calibration aufrufen
-  calibrate_free_air();
+  // Keine automatische Free-Air-Cal hier.
+  // UA_Offset wird aus EEPROM verwendet.
 }
 
 // ---------------- Setup ----------------
@@ -455,6 +483,8 @@ void setup() {
   DBGLN1("BOOT: Device reset");
   DBG2("BOOT: DEBUG_LEVEL="); DBGLN2(DEBUG_LEVEL);
   DBG2("BOOT: VREF_VOLTS="); DBGLN2(VREF_VOLTS);
+
+  pinMode(CAL_BUTTON_PIN, INPUT_PULLUP);
 
   Wire.begin();
   lcd.init();
@@ -471,6 +501,16 @@ void setup() {
   analogWrite(HEATER_OUTPUT_PIN, 0);
   analogWrite(ANALOG_OUTPUT_PIN, 0);
 
+  load_calibration();
+
+  if (ua_offset_valid) {
+    lcd_print_boot("Using cal");
+    delay(1000);
+  } else {
+    lcd_print_boot("No cal yet");
+    delay(1000);
+  }
+
   DBGLN1("INIT: Starting main sequence");
   start();
 }
@@ -479,21 +519,35 @@ void setup() {
 void loop() {
   CJ125_Status = COM_SPI(CJ125_DIAG_REG_REQUEST);
 
-  // ADC-Wert mit Offset korrigieren
   int raw_UA = analogRead(UA_ANALOG_INPUT_PIN);
   adcValue_UA = raw_UA + UA_Offset;
-
-  // Begrenzung auf gültige Werte
   if (adcValue_UA < 0) adcValue_UA = 0;
   if (adcValue_UA > 1023) adcValue_UA = 1023;
 
   adcValue_UR = analogRead(UR_ANALOG_INPUT_PIN);
   adcValue_UB = analogRead(UB_ANALOG_INPUT_PIN);
 
-  // Batteriespannung einmalig berechnen und mehrfach nutzen
   float UB_V_now = ubat_from_adc(adcValue_UB);
 
-  // PID control: nur wenn UR_Optimal bekannt und Versorgung ok
+  // Kalibrier-Taster abfragen (Flankenerkennung)
+  static bool cal_button_last = HIGH;
+  bool cal_button_now = digitalRead(CAL_BUTTON_PIN);
+
+  if (cal_button_last == HIGH && cal_button_now == LOW) {
+    DBGLN1("BUTTON: Free-Air-Cal requested");
+
+    if (CJ125_Status == CJ125_DIAG_REG_STATUS_OK && UB_V_now >= UBAT_MIN_V) {
+      lcd_print_boot("Free Air Cal");
+      calibrate_free_air();
+    } else {
+      DBGLN1("BUTTON: Cal denied (CJ125/UB not OK)");
+      lcd_print_boot("Cal denied");
+      delay(1000);
+    }
+  }
+  cal_button_last = cal_button_now;
+
+  // PID control nur bei gültiger UR_Optimal und ausreichender Spannung
   bool pid_enabled = (adcValue_UR_Optimal > 0) && (UB_V_now >= UBAT_MIN_V);
 
   if (pid_enabled) {
@@ -508,7 +562,6 @@ void loop() {
     DBGLN2("PID: Disabled (preconditions not met)");
   }
 
-  // Low power check
   if (UB_V_now < UBAT_MIN_V) {
     DBGLN1("ERROR: Low power -> restart sequence");
     lcd_print_boot("Low UB -> restart");
@@ -518,7 +571,6 @@ void loop() {
     return;
   }
 
-  // Status frame at SERIAL_RATE
   if ((100 / SERIAL_RATE) == serial_counter) {
     serial_counter = 0;
 
