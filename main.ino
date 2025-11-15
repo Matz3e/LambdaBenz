@@ -250,24 +250,25 @@ void lcd_print_boot(const char* line2) {
   lcd.print(line2);
 }
 
+// Fix: kein lcd.clear() hier, um Flackern zu reduzieren
 void lcd_print_two(float ub_v, int pwm, float lambda, float o2, bool lambda_valid, bool o2_valid) {
-  lcd.clear();
+  // Zeile 0: "UB x.xV AFRyy.y"
   lcd.setCursor(0,0);
   lcd.print("UB ");
   lcd.print(ub_v, 1);
   lcd.print("V AFR");
-  
-  // AFR basierend auf aktuellem Lambda berechnen (verfügbar, da adcValue_UA global ist)
+
   const float AirFuelRatioOctane = 14.70;
   float afr = Lookup_Lambda(adcValue_UA) * AirFuelRatioOctane;
   if (lambda_valid) {
-    lcd.print(afr, 1);  // z. B. "14.7"
+    lcd.print(afr, 1);
   } else {
-    lcd.print("-");
+    lcd.print("  - ");
   }
 
+  // Zeile 1: "Lx.xxx O2 yy.y%"
   lcd.setCursor(0,1);
-  lcd.print("L"); // 'l' fallback
+  lcd.print("L");
   if (lambda_valid) {
     lcd.print(lambda, 3);
   } else {
@@ -286,7 +287,7 @@ void lcd_print_two(float ub_v, int pwm, float lambda, float o2, bool lambda_vali
 void calibrate_free_air() {
   DBGLN1("FREE AIR CAL: Starting calibration on 20.9% O2");
   lcd_print_boot("Free Air Cal...");
-  
+
   // Sensor muss heiß und stabil sein - 30 Sekunden warten
   DBGLN1("FREE AIR CAL: Waiting for sensor to stabilize (30s)");
   for (int i = 0; i < 30; i++) {
@@ -295,7 +296,7 @@ void calibrate_free_air() {
     HeaterOutput = Heater_PID_Control(adcValue_UR);
     analogWrite(HEATER_OUTPUT_PIN, HeaterOutput);
     delay(1000);
-    
+
     // LCD Countdown
     lcd.clear();
     lcd.setCursor(0,0);
@@ -305,7 +306,7 @@ void calibrate_free_air() {
     lcd.print(30 - i);
     lcd.print("s");
   }
-  
+
   // 10 Messungen mitteln für Stabilität
   long ua_sum = 0;
   for (int i = 0; i < 10; i++) {
@@ -313,16 +314,16 @@ void calibrate_free_air() {
     delay(100);
   }
   int ua_average = ua_sum / 10;
-  
+
   // ADC-Wert für 20.9% O2 sollte bei ca. 854 liegen (laut Oxygen_Conversion Tabelle)
   const int TARGET_ADC_20_9_PERCENT = 854;
-  
+
   UA_Offset = TARGET_ADC_20_9_PERCENT - ua_average;
-  
+
   DBG1("FREE AIR CAL: Measured UA_ADC="); DBGLN1(ua_average);
   DBG1("FREE AIR CAL: Target UA_ADC="); DBGLN1(TARGET_ADC_20_9_PERCENT);
   DBG1("FREE AIR CAL: Calculated Offset="); DBGLN1(UA_Offset);
-  
+
   // Zeige Kalibrierungsergebnis
   lcd.clear();
   lcd.setCursor(0,0);
@@ -337,6 +338,11 @@ void calibrate_free_air() {
 void start() {
   DBGLN1("WAIT: Supply & CJ125 OK check...");
   lcd_print_boot("Wait CJ125/UB");
+
+  // Optional: Timeout für CJ125/UB-Wait
+  unsigned long start_ms = millis();
+  const unsigned long wait_timeout_ms = 10000; // 10s
+
   while (true) {
     CJ125_Status = COM_SPI(CJ125_DIAG_REG_REQUEST);
 
@@ -358,6 +364,14 @@ void start() {
       continue;
     }
     if (CJ125_Status == CJ125_DIAG_REG_STATUS_OK && UB_V >= UBAT_MIN_V) break;
+
+    // Timeout-Handling
+    if (millis() - start_ms > wait_timeout_ms) {
+      DBGLN1("ERROR: CJ125/UB wait timeout");
+      lcd_print_boot("CJ125/UB timeout");
+      delay(2000);
+      start_ms = millis(); // erneut versuchen
+    }
 
     delay(500);
   }
@@ -426,7 +440,7 @@ void start() {
   DBGLN1("HEAT: Heating phase complete, hand over to PID");
   lcd_print_boot("PID active");
   analogWrite(HEATER_OUTPUT_PIN, 0);
-  
+
   // Free-Air-Calibration aufrufen
   calibrate_free_air();
 }
@@ -437,7 +451,7 @@ void setup() {
     Serial.begin(9600);
     delay(50);
   #endif
-  
+
   DBGLN1("BOOT: Device reset");
   DBG2("BOOT: DEBUG_LEVEL="); DBGLN2(DEBUG_LEVEL);
   DBG2("BOOT: VREF_VOLTS="); DBGLN2(VREF_VOLTS);
@@ -464,20 +478,25 @@ void setup() {
 // ---------------- Loop ----------------
 void loop() {
   CJ125_Status = COM_SPI(CJ125_DIAG_REG_REQUEST);
-  
+
   // ADC-Wert mit Offset korrigieren
   int raw_UA = analogRead(UA_ANALOG_INPUT_PIN);
   adcValue_UA = raw_UA + UA_Offset;
-  
+
   // Begrenzung auf gültige Werte
   if (adcValue_UA < 0) adcValue_UA = 0;
   if (adcValue_UA > 1023) adcValue_UA = 1023;
-  
+
   adcValue_UR = analogRead(UR_ANALOG_INPUT_PIN);
   adcValue_UB = analogRead(UB_ANALOG_INPUT_PIN);
 
-  // PID control
-  if (adcValue_UR < 500 || adcValue_UR_Optimal != 0 || ubat_from_adc(adcValue_UB) >= UBAT_MIN_V) {
+  // Batteriespannung einmalig berechnen und mehrfach nutzen
+  float UB_V_now = ubat_from_adc(adcValue_UB);
+
+  // PID control: nur wenn UR_Optimal bekannt und Versorgung ok
+  bool pid_enabled = (adcValue_UR_Optimal > 0) && (UB_V_now >= UBAT_MIN_V);
+
+  if (pid_enabled) {
     HeaterOutput = Heater_PID_Control(adcValue_UR);
     analogWrite(HEATER_OUTPUT_PIN, HeaterOutput);
     DBG2("PID: UR="); DBG2(adcValue_UR);
@@ -490,10 +509,11 @@ void loop() {
   }
 
   // Low power check
-  float UB_V_now = ubat_from_adc(adcValue_UB);
   if (UB_V_now < UBAT_MIN_V) {
     DBGLN1("ERROR: Low power -> restart sequence");
     lcd_print_boot("Low UB -> restart");
+    HeaterOutput = 0;
+    analogWrite(HEATER_OUTPUT_PIN, HeaterOutput);
     start();
     return;
   }
